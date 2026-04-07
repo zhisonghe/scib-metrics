@@ -41,3 +41,18 @@ def dummy_benchmarker_adata():
         adata.obsm[key] = X
         embedding_keys.append(key)
     return adata, embedding_keys, labels_key, batch_key
+
+
+def dummy_benchmarker_adata_with_precomputed_neighbors():
+    X, labels, batch = dummy_x_labels_batch(x_is_neighbors_results=False)
+    adata = anndata.AnnData(X)
+    labels_key = "labels"
+    batch_key = "batch"
+    adata.obs[labels_key] = labels
+    adata.obs[batch_key] = batch
+
+    neigh_result = scib_metrics.nearest_neighbors.pynndescent(X, n_neighbors=90, random_state=0, n_jobs=1)
+    for n in (15, 50, 90):
+        adata.uns[f"{n}_neighbor_res"] = neigh_result.subset_neighbors(n=n)
+
+    return adata, labels_key, batch_key

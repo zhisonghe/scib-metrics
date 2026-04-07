@@ -48,6 +48,14 @@ metric_name_cleaner = {
     "pcr_comparison": "PCR comparison",
 }
 
+_NEIGHBOR_GRAPH_METRICS = {
+    "nmi_ari_cluster_labels_leiden",
+    "clisi_knn",
+    "graph_connectivity",
+    "ilisi_knn",
+    "kbet_per_label",
+}
+
 
 @dataclass(frozen=True)
 class BioConservation:
@@ -108,7 +116,9 @@ class Benchmarker:
     label_key
         Key in `adata.obs` that contains the cell type labels.
     embedding_obsm_keys
-        List of obsm keys that contain the embeddings to be benchmarked.
+        List of obsm keys that contain the embeddings to be benchmarked. If `None` or empty,
+        the benchmarker expects precomputed neighbor graphs in `adata.uns` under
+        `"15_neighbor_res"`, `"50_neighbor_res"`, and `"90_neighbor_res"`.
     bio_conservation_metrics
         Specification of which bio conservation metrics to run in the pipeline.
     batch_correction_metrics
@@ -139,7 +149,7 @@ class Benchmarker:
         adata: AnnData,
         batch_key: str,
         label_key: str,
-        embedding_obsm_keys: list[str],
+        embedding_obsm_keys: list[str] | None = None,
         bio_conservation_metrics: BioConservation | None = BioConservation(),
         batch_correction_metrics: BatchCorrection | None = BatchCorrection(),
         pre_integrated_embedding_obsm_key: str | None = None,
@@ -148,13 +158,16 @@ class Benchmarker:
         solver: str = "arpack",
     ):
         self._adata = adata
-        self._embedding_obsm_keys = embedding_obsm_keys
+        self._embedding_obsm_keys = list(embedding_obsm_keys) if embedding_obsm_keys is not None else []
         self._pre_integrated_embedding_obsm_key = pre_integrated_embedding_obsm_key
         self._bio_conservation_metrics = bio_conservation_metrics
         self._batch_correction_metrics = batch_correction_metrics
+        self._neighbor_values = (15, 50, 90)
+        self._use_precomputed_neighbors = len(self._embedding_obsm_keys) == 0
+        if self._use_precomputed_neighbors:
+            self._embedding_obsm_keys = ["precomputed_neighbors"]
         self._results = pd.DataFrame(columns=list(self._embedding_obsm_keys) + [_METRIC_TYPE])
         self._emb_adatas = {}
-        self._neighbor_values = (15, 50, 90)
         self._prepared = False
         self._benchmarked = False
         self._batch_key = batch_key
@@ -173,6 +186,41 @@ class Benchmarker:
         if self._batch_correction_metrics is not None:
             self._metric_collection_dict.update({"Batch correction": self._batch_correction_metrics})
 
+        if self._use_precomputed_neighbors:
+            self._initialize_precomputed_neighbors_mode()
+
+    def _initialize_precomputed_neighbors_mode(self) -> None:
+        """Initialize benchmarking from precomputed neighbor graphs."""
+        required_neighbor_keys = [f"{n}_neighbor_res" for n in self._neighbor_values]
+        missing = [k for k in required_neighbor_keys if k not in self._adata.uns]
+        if missing:
+            raise ValueError(
+                "When `embedding_obsm_keys` is not provided, precomputed neighbor mode is used and "
+                f"`adata.uns` must contain {required_neighbor_keys}. Missing: {missing}"
+            )
+
+        for key in required_neighbor_keys:
+            if not isinstance(self._adata.uns[key], NeighborsResults):
+                raise TypeError(
+                    f"`adata.uns['{key}']` must be a NeighborsResults object, "
+                    f"but got {type(self._adata.uns[key]).__name__}."
+                )
+
+        ad = AnnData(self._adata.X, obs=self._adata.obs.copy())
+        ad.obs[_BATCH] = np.asarray(self._adata.obs[self._batch_key].values)
+        ad.obs[_LABELS] = np.asarray(self._adata.obs[self._label_key].values)
+        for key in required_neighbor_keys:
+            ad.uns[key] = self._adata.uns[key]
+
+        self._emb_adatas[self._embedding_obsm_keys[0]] = ad
+        self._compute_neighbors = False
+        self._prepared = True
+
+    def _metric_enabled_in_current_mode(self, metric_name: str) -> bool:
+        if not self._use_precomputed_neighbors:
+            return True
+        return metric_name in _NEIGHBOR_GRAPH_METRICS
+
     def prepare(self, neighbor_computer: Callable[[np.ndarray, int], NeighborsResults] | None = None) -> None:
         """Prepare the data for benchmarking.
 
@@ -184,6 +232,14 @@ class Benchmarker:
             the data and the number of neighbors to compute and return a :class:`~scib_metrics.utils.nearest_neighbors.NeighborsResults`
             object.
         """
+        if self._use_precomputed_neighbors:
+            warnings.warn(
+                "Benchmarker initialized with precomputed neighbor graphs. `prepare()` is skipped.",
+                UserWarning,
+            )
+            self._prepared = True
+            return
+
         gc.collect()
 
         # Compute PCA
@@ -234,7 +290,15 @@ class Benchmarker:
             self.prepare()
 
         num_metrics = sum(
-            [sum([v is not False for v in asdict(met_col)]) for met_col in self._metric_collection_dict.values()]
+            [
+                sum(
+                    [
+                        (v is not False) and self._metric_enabled_in_current_mode(metric_name)
+                        for metric_name, v in asdict(met_col).items()
+                    ]
+                )
+                for met_col in self._metric_collection_dict.values()
+            ]
         )
 
         progress_embs = self._emb_adatas.items()
@@ -248,6 +312,8 @@ class Benchmarker:
             for metric_type, metric_collection in self._metric_collection_dict.items():
                 for metric_name, use_metric_or_kwargs in asdict(metric_collection).items():
                     gc.collect()
+                    if not self._metric_enabled_in_current_mode(metric_name):
+                        continue
                     if use_metric_or_kwargs:
                         pbar.set_postfix_str(f"{metric_type}: {metric_name}") if pbar is not None else None
                         metric_fn = getattr(scib_metrics, metric_name)
