@@ -51,8 +51,8 @@ def dummy_benchmarker_adata_with_precomputed_neighbors():
     adata.obs[labels_key] = labels
     adata.obs[batch_key] = batch
 
-    neigh_result = scib_metrics.nearest_neighbors.pynndescent(X, n_neighbors=90, random_state=0, n_jobs=1)
-    for n in (15, 50, 90):
-        adata.uns[f"{n}_neighbor_res"] = neigh_result.subset_neighbors(n=n)
+    neigh_result = scib_metrics.nearest_neighbors.pynndescent(X, n_neighbors=30, random_state=0, n_jobs=1)
+    adata.uns["nn_graph_neighbors"] = neigh_result
+    adata.uns["nn_graph_sparse"] = neigh_result.knn_graph_distances
 
-    return adata, labels_key, batch_key
+    return adata, ["nn_graph_neighbors", "nn_graph_sparse"], labels_key, batch_key

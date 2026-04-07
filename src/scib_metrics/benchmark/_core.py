@@ -16,11 +16,13 @@ from anndata import AnnData
 from plottable import ColumnDefinition, Table
 from plottable.cmap import normed_cmap
 from plottable.plots import bar
+from scipy.sparse import spmatrix
 from sklearn.preprocessing import MinMaxScaler
 from tqdm import tqdm
 
 import scib_metrics
 from scib_metrics.nearest_neighbors import NeighborsResults, pynndescent
+from scib_metrics.utils import convert_knn_graph_to_idx
 
 Kwargs = dict[str, Any]
 MetricType = bool | Kwargs
@@ -116,9 +118,13 @@ class Benchmarker:
     label_key
         Key in `adata.obs` that contains the cell type labels.
     embedding_obsm_keys
-        List of obsm keys that contain the embeddings to be benchmarked. If `None` or empty,
-        the benchmarker expects precomputed neighbor graphs in `adata.uns` under
-        `"15_neighbor_res"`, `"50_neighbor_res"`, and `"90_neighbor_res"`.
+        List of obsm keys that contain the embeddings to be benchmarked.
+    precomputed_neighbor_uns_keys
+        List of keys in `adata.uns` that point to precomputed neighbor data, where each key
+        corresponds to a separate embedding to benchmark. Each value can be either a
+        :class:`~scib_metrics.utils.nearest_neighbors.NeighborsResults` object or a sparse
+        distance matrix. When provided, `prepare()` is skipped and only neighbor-graph metrics
+        are executed.
     bio_conservation_metrics
         Specification of which bio conservation metrics to run in the pipeline.
     batch_correction_metrics
@@ -150,6 +156,7 @@ class Benchmarker:
         batch_key: str,
         label_key: str,
         embedding_obsm_keys: list[str] | None = None,
+        precomputed_neighbor_uns_keys: list[str] | None = None,
         bio_conservation_metrics: BioConservation | None = BioConservation(),
         batch_correction_metrics: BatchCorrection | None = BatchCorrection(),
         pre_integrated_embedding_obsm_key: str | None = None,
@@ -159,13 +166,23 @@ class Benchmarker:
     ):
         self._adata = adata
         self._embedding_obsm_keys = list(embedding_obsm_keys) if embedding_obsm_keys is not None else []
+        self._precomputed_neighbor_uns_keys = (
+            list(precomputed_neighbor_uns_keys) if precomputed_neighbor_uns_keys is not None else []
+        )
         self._pre_integrated_embedding_obsm_key = pre_integrated_embedding_obsm_key
         self._bio_conservation_metrics = bio_conservation_metrics
         self._batch_correction_metrics = batch_correction_metrics
         self._neighbor_values = (15, 50, 90)
-        self._use_precomputed_neighbors = len(self._embedding_obsm_keys) == 0
+        self._use_precomputed_neighbors = len(self._precomputed_neighbor_uns_keys) > 0
+
+        if self._use_precomputed_neighbors and len(self._embedding_obsm_keys) > 0:
+            raise ValueError("Provide only one of `embedding_obsm_keys` or `precomputed_neighbor_uns_keys`.")
+        if not self._use_precomputed_neighbors and len(self._embedding_obsm_keys) == 0:
+            raise ValueError("`embedding_obsm_keys` must be provided unless `precomputed_neighbor_uns_keys` is used.")
+
         if self._use_precomputed_neighbors:
-            self._embedding_obsm_keys = ["precomputed_neighbors"]
+            self._embedding_obsm_keys = list(self._precomputed_neighbor_uns_keys)
+
         self._results = pd.DataFrame(columns=list(self._embedding_obsm_keys) + [_METRIC_TYPE])
         self._emb_adatas = {}
         self._prepared = False
@@ -191,30 +208,40 @@ class Benchmarker:
 
     def _initialize_precomputed_neighbors_mode(self) -> None:
         """Initialize benchmarking from precomputed neighbor graphs."""
-        required_neighbor_keys = [f"{n}_neighbor_res" for n in self._neighbor_values]
-        missing = [k for k in required_neighbor_keys if k not in self._adata.uns]
+        missing = [k for k in self._precomputed_neighbor_uns_keys if k not in self._adata.uns]
         if missing:
             raise ValueError(
-                "When `embedding_obsm_keys` is not provided, precomputed neighbor mode is used and "
-                f"`adata.uns` must contain {required_neighbor_keys}. Missing: {missing}"
+                "When `precomputed_neighbor_uns_keys` is provided, each key must exist in `adata.uns`. "
+                f"Missing: {missing}"
             )
 
-        for key in required_neighbor_keys:
-            if not isinstance(self._adata.uns[key], NeighborsResults):
-                raise TypeError(
-                    f"`adata.uns['{key}']` must be a NeighborsResults object, "
-                    f"but got {type(self._adata.uns[key]).__name__}."
-                )
+        for key in self._precomputed_neighbor_uns_keys:
+            neighbor_data = self._adata.uns[key]
+            neigh_result = self._to_neighbors_results(neighbor_data, key=key)
 
-        ad = AnnData(self._adata.X, obs=self._adata.obs.copy())
-        ad.obs[_BATCH] = np.asarray(self._adata.obs[self._batch_key].values)
-        ad.obs[_LABELS] = np.asarray(self._adata.obs[self._label_key].values)
-        for key in required_neighbor_keys:
-            ad.uns[key] = self._adata.uns[key]
+            ad = AnnData(self._adata.X, obs=self._adata.obs.copy())
+            ad.obs[_BATCH] = np.asarray(self._adata.obs[self._batch_key].values)
+            ad.obs[_LABELS] = np.asarray(self._adata.obs[self._label_key].values)
 
-        self._emb_adatas[self._embedding_obsm_keys[0]] = ad
+            # Keep benchmark metric API unchanged by wiring the same graph to all expected slots.
+            for n in self._neighbor_values:
+                ad.uns[f"{n}_neighbor_res"] = neigh_result
+
+            self._emb_adatas[key] = ad
+
         self._compute_neighbors = False
         self._prepared = True
+
+    def _to_neighbors_results(self, neighbor_data: Any, key: str) -> NeighborsResults:
+        if isinstance(neighbor_data, NeighborsResults):
+            return neighbor_data
+        if isinstance(neighbor_data, spmatrix):
+            distances, indices = convert_knn_graph_to_idx(neighbor_data.tocsr())
+            return NeighborsResults(indices=indices, distances=distances)
+        raise TypeError(
+            f"`adata.uns['{key}']` must be a NeighborsResults object or sparse distance matrix, "
+            f"but got {type(neighbor_data).__name__}."
+        )
 
     def _metric_enabled_in_current_mode(self, metric_name: str) -> bool:
         if not self._use_precomputed_neighbors:

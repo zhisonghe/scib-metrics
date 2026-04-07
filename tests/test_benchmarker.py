@@ -85,12 +85,13 @@ def test_benchmarker_custom_near_neighs():
 
 
 def test_benchmarker_precomputed_neighbors_mode():
-    ad, labels_key, batch_key = dummy_benchmarker_adata_with_precomputed_neighbors()
+    ad, uns_keys, labels_key, batch_key = dummy_benchmarker_adata_with_precomputed_neighbors()
     bm = Benchmarker(
         ad,
         batch_key,
         labels_key,
         embedding_obsm_keys=None,
+        precomputed_neighbor_uns_keys=uns_keys,
         batch_correction_metrics=BatchCorrection(),
         bio_conservation_metrics=BioConservation(nmi_ari_cluster_labels_leiden=True),
     )
@@ -103,6 +104,7 @@ def test_benchmarker_precomputed_neighbors_mode():
     results = bm.get_results(clean_names=False)
 
     assert isinstance(results, pd.DataFrame)
+    assert set(results.index) >= set(uns_keys)
     # Neighbor-only metrics should be present.
     assert "nmi_ari_cluster_labels_leiden_nmi" in results.columns
     assert "nmi_ari_cluster_labels_leiden_ari" in results.columns
