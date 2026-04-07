@@ -54,7 +54,25 @@ def convert_knn_graph_to_idx(X: csr_matrix) -> tuple[np.ndarray, np.ndarray]:
 
     n_neighbors = np.unique(X.nonzero()[0], return_counts=True)[1]
     if len(np.unique(n_neighbors)) > 1:
-        raise ValueError("Each cell must have the same number of neighbors.")
+        n_neighbors = int(np.min(n_neighbors))
+        warnings.warn(
+            "Sparse distance matrix has variable per-cell neighbor counts. "
+            f"Trimming each row to the {n_neighbors} smallest distances.",
+            UserWarning,
+        )
+
+        n_samples = X.shape[0]
+        distances = np.empty((n_samples, n_neighbors), dtype=X.dtype)
+        indices = np.empty((n_samples, n_neighbors), dtype=np.int64)
+        for i in range(n_samples):
+            start = X.indptr[i]
+            end = X.indptr[i + 1]
+            row_distances = X.data[start:end]
+            row_indices = X.indices[start:end]
+            keep = np.argsort(row_distances)[:n_neighbors]
+            distances[i] = row_distances[keep]
+            indices[i] = row_indices[keep]
+        return distances, indices
 
     n_neighbors = int(np.unique(n_neighbors)[0])
     with warnings.catch_warnings():
