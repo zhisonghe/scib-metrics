@@ -36,6 +36,39 @@ Currently we are porting metrics used in the scIB [manuscript](https://www.natur
 
 Please refer to the [documentation][link-docs].
 
+## Benchmarker Input Modes
+
+`Benchmarker` supports two input modes:
+
+1. Standard embedding mode (existing behavior):
+  Provide `embedding_obsm_keys`, and `prepare()` reconstructs neighbor graphs per embedding.
+
+2. Precomputed neighbor-graph mode:
+  Provide `precomputed_neighbor_uns_keys`, where each key in `adata.uns` points to one precomputed
+  graph for one embedding. Each value can be either:
+  - a `NeighborsResults` object, or
+  - a sparse distance matrix.
+
+In precomputed mode, `prepare()` is skipped, only neighbor-graph-based metrics are run, and each input
+graph is internally reused for the `15_neighbor_res`, `50_neighbor_res`, and `90_neighbor_res` slots.
+
+Example:
+
+```python
+from scib_metrics.benchmark import Benchmarker, BioConservation, BatchCorrection
+
+bm = Benchmarker(
+   adata,
+   batch_key="batch",
+   label_key="cell_type",
+   precomputed_neighbor_uns_keys=["graph_emb1", "graph_emb2"],
+   bio_conservation_metrics=BioConservation(nmi_ari_cluster_labels_leiden=True),
+   batch_correction_metrics=BatchCorrection(),
+)
+bm.benchmark()
+results = bm.get_results()
+```
+
 ## Installation
 
 You need to have Python 3.10 or newer installed on your system. If you don't have
