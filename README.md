@@ -28,9 +28,26 @@
 
 Accelerated and Python-only metrics for benchmarking single-cell integration outputs.
 
+This repository is a fork of the original `scib-metrics` project and is adapted to support benchmarking from precomputed neighbor graphs (including sparse distance graphs) as input, in addition to embedding-based inputs.
+
 This package contains implementations of metrics for evaluating the performance of single-cell omics data integration methods. The implementations of these metrics use [JAX](https://jax.readthedocs.io/en/latest/) when possible for jit-compilation and hardware acceleration. All implementations are in Python.
 
 Currently we are porting metrics used in the scIB [manuscript](https://www.nature.com/articles/s41592-021-01336-8) (and [code](https://github.com/theislab/scib)). Deviations from the original implementations are documented. However, metric values from this repository should not be compared to the scIB repository.
+
+## Fork-specific changes
+
+This fork focuses on adapting benchmarking workflows to accept precomputed neighbor graphs as first-class inputs.
+
+1. The benchmarker can run from precomputed graphs stored in `adata.uns`, instead of requiring only embedding matrices in `adata.obsm`.
+2. Each precomputed graph key is treated as one benchmarked method/embedding.
+3. Supported precomputed graph input types include `NeighborsResults` and sparse distance matrices.
+4. In precomputed-graph mode, `prepare()` is skipped and only neighbor-graph-based metrics are run.
+5. Metrics computed in precomputed-graph mode:
+  - Bio conservation: `clisi_knn`, `nmi_ari_cluster_labels_leiden`.
+  - Batch correction: `ilisi_knn`, `kbet_per_label`, `graph_connectivity`.
+6. Metrics skipped in precomputed-graph mode (because they require embedding matrices):
+  - Bio conservation: `isolated_labels`, `nmi_ari_cluster_labels_kmeans`, `silhouette_label`.
+  - Batch correction: `bras`, `pcr_comparison`.
 
 ## Getting started
 
@@ -51,6 +68,14 @@ Please refer to the [documentation][link-docs].
 
 In precomputed mode, `prepare()` is skipped, only neighbor-graph-based metrics are run, and each input
 graph is internally reused for the `15_neighbor_res`, `50_neighbor_res`, and `90_neighbor_res` slots.
+
+Specifically, precomputed mode runs only:
+- Bio conservation: `clisi_knn`, `nmi_ari_cluster_labels_leiden`.
+- Batch correction: `ilisi_knn`, `kbet_per_label`, `graph_connectivity`.
+
+It skips:
+- Bio conservation: `isolated_labels`, `nmi_ari_cluster_labels_kmeans`, `silhouette_label`.
+- Batch correction: `bras`, `pcr_comparison`.
 
 Example:
 
