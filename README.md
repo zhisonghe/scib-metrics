@@ -61,10 +61,11 @@ Please refer to the [documentation][link-docs].
   Provide `embedding_obsm_keys`, and `prepare()` reconstructs neighbor graphs per embedding.
 
 2. Precomputed neighbor-graph mode:
-  Provide `precomputed_neighbor_uns_keys`, where each key in `adata.uns` points to one precomputed
-  graph for one embedding. Each value can be either:
-  - a `NeighborsResults` object, or
-  - a sparse distance matrix.
+  Provide one of the following, where each key corresponds to one embedding to benchmark:
+  - `precomputed_neighbor_uns_keys`: keys in `adata.uns`, each pointing to a `NeighborsResults`
+    object or a sparse distance matrix.
+  - `precomputed_neighbor_obsp_keys`: keys in `adata.obsp`, each pointing to a sparse distance
+    matrix (the typical storage location for distance matrices in AnnData).
 
 In precomputed mode, `prepare()` is skipped, only neighbor-graph-based metrics are run, and each input
 graph is internally reused for the `15_neighbor_res`, `50_neighbor_res`, and `90_neighbor_res` slots.
@@ -77,11 +78,12 @@ It skips:
 - Bio conservation: `isolated_labels`, `nmi_ari_cluster_labels_kmeans`, `silhouette_label`.
 - Batch correction: `bras`, `pcr_comparison`.
 
-Example:
+Examples:
 
 ```python
 from scib_metrics.benchmark import Benchmarker, BioConservation, BatchCorrection
 
+# From adata.uns (NeighborsResults or sparse distance matrix)
 bm = Benchmarker(
    adata,
    batch_key="batch",
@@ -90,6 +92,17 @@ bm = Benchmarker(
    bio_conservation_metrics=BioConservation(nmi_ari_cluster_labels_leiden=True),
    batch_correction_metrics=BatchCorrection(),
 )
+
+# From adata.obsp (sparse distance matrix)
+bm = Benchmarker(
+   adata,
+   batch_key="batch",
+   label_key="cell_type",
+   precomputed_neighbor_obsp_keys=["distances_emb1", "distances_emb2"],
+   bio_conservation_metrics=BioConservation(nmi_ari_cluster_labels_leiden=True),
+   batch_correction_metrics=BatchCorrection(),
+)
+
 bm.benchmark()
 results = bm.get_results()
 ```
