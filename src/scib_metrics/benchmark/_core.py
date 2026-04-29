@@ -125,6 +125,10 @@ class Benchmarker:
         :class:`~scib_metrics.utils.nearest_neighbors.NeighborsResults` object or a sparse
         distance matrix. When provided, `prepare()` is skipped and only neighbor-graph metrics
         are executed.
+    precomputed_neighbor_obsp_keys
+        List of keys in `adata.obsp` that contain precomputed sparse distance matrices, where
+        each key corresponds to a separate embedding to benchmark. When provided, `prepare()` is
+        skipped and only neighbor-graph metrics are executed.
     bio_conservation_metrics
         Specification of which bio conservation metrics to run in the pipeline.
     batch_correction_metrics
@@ -157,6 +161,7 @@ class Benchmarker:
         label_key: str,
         embedding_obsm_keys: list[str] | None = None,
         precomputed_neighbor_uns_keys: list[str] | None = None,
+        precomputed_neighbor_obsp_keys: list[str] | None = None,
         bio_conservation_metrics: BioConservation | None = BioConservation(),
         batch_correction_metrics: BatchCorrection | None = BatchCorrection(),
         pre_integrated_embedding_obsm_key: str | None = None,
@@ -169,19 +174,35 @@ class Benchmarker:
         self._precomputed_neighbor_uns_keys = (
             list(precomputed_neighbor_uns_keys) if precomputed_neighbor_uns_keys is not None else []
         )
+        self._precomputed_neighbor_obsp_keys = (
+            list(precomputed_neighbor_obsp_keys) if precomputed_neighbor_obsp_keys is not None else []
+        )
         self._pre_integrated_embedding_obsm_key = pre_integrated_embedding_obsm_key
         self._bio_conservation_metrics = bio_conservation_metrics
         self._batch_correction_metrics = batch_correction_metrics
         self._neighbor_values = (15, 50, 90)
-        self._use_precomputed_neighbors = len(self._precomputed_neighbor_uns_keys) > 0
+        self._use_precomputed_neighbors = (
+            len(self._precomputed_neighbor_uns_keys) > 0 or len(self._precomputed_neighbor_obsp_keys) > 0
+        )
 
+        if len(self._precomputed_neighbor_uns_keys) > 0 and len(self._precomputed_neighbor_obsp_keys) > 0:
+            raise ValueError(
+                "Provide only one of `precomputed_neighbor_uns_keys` or `precomputed_neighbor_obsp_keys`."
+            )
         if self._use_precomputed_neighbors and len(self._embedding_obsm_keys) > 0:
-            raise ValueError("Provide only one of `embedding_obsm_keys` or `precomputed_neighbor_uns_keys`.")
+            raise ValueError(
+                "Provide only one of `embedding_obsm_keys` or the precomputed neighbor keys."
+            )
         if not self._use_precomputed_neighbors and len(self._embedding_obsm_keys) == 0:
-            raise ValueError("`embedding_obsm_keys` must be provided unless `precomputed_neighbor_uns_keys` is used.")
+            raise ValueError(
+                "`embedding_obsm_keys` must be provided unless `precomputed_neighbor_uns_keys` or "
+                "`precomputed_neighbor_obsp_keys` is used."
+            )
 
-        if self._use_precomputed_neighbors:
+        if len(self._precomputed_neighbor_uns_keys) > 0:
             self._embedding_obsm_keys = list(self._precomputed_neighbor_uns_keys)
+        elif len(self._precomputed_neighbor_obsp_keys) > 0:
+            self._embedding_obsm_keys = list(self._precomputed_neighbor_obsp_keys)
 
         self._results = pd.DataFrame(columns=list(self._embedding_obsm_keys) + [_METRIC_TYPE])
         self._emb_adatas = {}
@@ -203,11 +224,13 @@ class Benchmarker:
         if self._batch_correction_metrics is not None:
             self._metric_collection_dict.update({"Batch correction": self._batch_correction_metrics})
 
-        if self._use_precomputed_neighbors:
+        if len(self._precomputed_neighbor_uns_keys) > 0:
             self._initialize_precomputed_neighbors_mode()
+        elif len(self._precomputed_neighbor_obsp_keys) > 0:
+            self._initialize_precomputed_neighbors_obsp_mode()
 
     def _initialize_precomputed_neighbors_mode(self) -> None:
-        """Initialize benchmarking from precomputed neighbor graphs."""
+        """Initialize benchmarking from precomputed neighbor graphs stored in `adata.uns`."""
         missing = [k for k in self._precomputed_neighbor_uns_keys if k not in self._adata.uns]
         if missing:
             raise ValueError(
@@ -217,6 +240,37 @@ class Benchmarker:
 
         for key in self._precomputed_neighbor_uns_keys:
             neighbor_data = self._adata.uns[key]
+            neigh_result = self._to_neighbors_results(neighbor_data, key=key)
+
+            ad = AnnData(self._adata.X, obs=self._adata.obs.copy())
+            ad.obs[_BATCH] = np.asarray(self._adata.obs[self._batch_key].values)
+            ad.obs[_LABELS] = np.asarray(self._adata.obs[self._label_key].values)
+
+            # Keep benchmark metric API unchanged by wiring the same graph to all expected slots.
+            for n in self._neighbor_values:
+                ad.uns[f"{n}_neighbor_res"] = neigh_result
+
+            self._emb_adatas[key] = ad
+
+        self._compute_neighbors = False
+        self._prepared = True
+
+    def _initialize_precomputed_neighbors_obsp_mode(self) -> None:
+        """Initialize benchmarking from sparse distance matrices stored in `adata.obsp`."""
+        missing = [k for k in self._precomputed_neighbor_obsp_keys if k not in self._adata.obsp]
+        if missing:
+            raise ValueError(
+                "When `precomputed_neighbor_obsp_keys` is provided, each key must exist in `adata.obsp`. "
+                f"Missing: {missing}"
+            )
+
+        for key in self._precomputed_neighbor_obsp_keys:
+            neighbor_data = self._adata.obsp[key]
+            if not isinstance(neighbor_data, spmatrix):
+                raise TypeError(
+                    f"`adata.obsp['{key}']` must be a sparse distance matrix, "
+                    f"but got {type(neighbor_data).__name__}."
+                )
             neigh_result = self._to_neighbors_results(neighbor_data, key=key)
 
             ad = AnnData(self._adata.X, obs=self._adata.obs.copy())
@@ -263,6 +317,7 @@ class Benchmarker:
             warnings.warn(
                 "Benchmarker initialized with precomputed neighbor graphs. `prepare()` is skipped.",
                 UserWarning,
+                stacklevel=2,
             )
             self._prepared = True
             return
