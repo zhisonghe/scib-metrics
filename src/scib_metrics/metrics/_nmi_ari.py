@@ -345,6 +345,18 @@ def nmi_ari_cluster_labels_leiden(
             return {"nmi": float(nmi), "ari": float(ari)}
         except RuntimeError as e:
             if "out_of_memory" in str(e) or "bad_alloc" in str(e) or "cudaErrorMemoryAllocation" in str(e):
+                # Free GPU memory from all known pools before falling back to CPU
+                try:
+                    import cupy as cp
+                    cp.get_default_memory_pool().free_all_blocks()
+                    cp.get_default_pinned_memory_pool().free_all_blocks()
+                except Exception:
+                    pass
+                try:
+                    import torch
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
                 warnings.warn(
                     f"GPU out-of-memory during Leiden NMI/ARI computation ({e}). "
                     "Falling back to CPU path.",
