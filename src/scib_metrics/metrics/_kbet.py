@@ -118,7 +118,7 @@ def kbet(
     X: NeighborsResults,
     batches: np.ndarray,
     alpha: float = 0.05,
-    flavor: Literal["auto", "cpu", "gpu"] = "auto",
+    flavor: Literal["auto", "jax", "torch"] = "auto",
 ) -> float:
     """Compute kbet :cite:p:`buttner2018`.
 
@@ -144,10 +144,10 @@ def kbet(
         Significance level for the statistical test.
     flavor
         Which backend to use for computation.  ``"auto"`` (default) selects
-        ``"gpu"`` when a CUDA-capable GPU is available (via PyTorch), and falls
-        back to ``"cpu"`` otherwise.  ``"cpu"`` forces the JAX CPU backend.
-        ``"gpu"`` forces the PyTorch CUDA backend (raises ``RuntimeError`` if
-        no GPU is found).
+        ``"torch"`` when a CUDA-capable GPU is available (via PyTorch), and
+        falls back to ``"jax"`` otherwise.  ``"jax"`` forces the JAX backend.
+        ``"torch"`` forces the PyTorch CUDA backend (raises ``RuntimeError``
+        if no GPU is found).
 
     Returns
     -------
@@ -166,11 +166,11 @@ def kbet(
     chex.assert_equal_shape([neigh_batch_ids, knn_idx])
     n_batches = len(np.unique(batches))
 
-    use_gpu = (flavor == "gpu") or (flavor == "auto" and _kbet_gpu_available())
-    if flavor == "gpu" and not _kbet_gpu_available():
+    use_gpu = (flavor == "torch") or (flavor == "auto" and _kbet_gpu_available())
+    if flavor == "torch" and not _kbet_gpu_available():
         raise RuntimeError(
-            "flavor='gpu' requested but PyTorch CUDA is not available. "
-            "Install torch with CUDA support or use flavor='auto'/'cpu'."
+            "flavor='torch' requested but PyTorch CUDA is not available. "
+            "Install torch with CUDA support or use flavor='auto'/'jax'."
         )
 
     if use_gpu:
@@ -193,7 +193,7 @@ def kbet_per_label(
     alpha: float = 0.05,
     diffusion_n_comps: int = 100,
     return_df: bool = False,
-    flavor: Literal["auto", "cpu", "gpu"] = "auto",
+    flavor: Literal["auto", "jax", "torch"] = "auto",
 ) -> float | tuple[float, pd.DataFrame]:
     """Compute kBET score per cell type label as in :cite:p:`luecken2022benchmarking`.
 
@@ -219,9 +219,9 @@ def kbet_per_label(
         Return dataframe of results in addition to score.
     flavor
         Which backend to use for computation.  ``"auto"`` (default) selects
-        ``"gpu"`` when a CUDA-capable GPU is available (via PyTorch), and falls
-        back to ``"cpu"`` otherwise.  Forwarded to each internal call of
-        :func:`kbet`.
+        ``"torch"`` when a CUDA-capable GPU is available (via PyTorch), and
+        falls back to ``"jax"`` otherwise.  Forwarded to each internal call
+        of :func:`kbet`.
 
     Returns
     -------
