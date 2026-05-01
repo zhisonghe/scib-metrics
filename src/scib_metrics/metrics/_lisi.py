@@ -94,10 +94,20 @@ def clisi_knn(X: NeighborsResults, labels: np.ndarray, perplexity: float = None,
     clisi
         cLISI score.
     """
-    labels = np.asarray(pd.Categorical(labels).codes)
-    lisi = lisi_knn(X, labels, perplexity=perplexity)
-    clisi = np.nanmedian(lisi)
+    labels = np.asarray(labels)
+    nan_mask = np.array([v is None or (isinstance(v, float) and np.isnan(v)) for v in labels], dtype=bool)
+    if nan_mask.any():
+        import warnings
+        warnings.warn(
+            f"Found {nan_mask.sum()} cells with NaN labels. These cells will be excluded from cLISI computation.",
+            UserWarning,
+        )
+    labels_coded = np.asarray(pd.Categorical(labels).codes)
+    lisi = lisi_knn(X, labels_coded, perplexity=perplexity)
+    # Exclude NaN-labeled cells from the summary statistic
+    lisi_valid = lisi[~nan_mask]
+    clisi = np.nanmedian(lisi_valid)
     if scale:
-        nlabels = len(np.unique(labels))
+        nlabels = len(np.unique(labels[~nan_mask]))
         clisi = (nlabels - clisi) / (nlabels - 1)
     return clisi

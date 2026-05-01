@@ -137,6 +137,19 @@ def kbet_per_label(
 
     conn_graph = X.knn_graph_connectivities
 
+    # Drop cells with NaN labels
+    nan_mask = np.array([v is None or (isinstance(v, float) and np.isnan(v)) for v in labels], dtype=bool)
+    if nan_mask.any():
+        import warnings
+        warnings.warn(
+            f"Found {nan_mask.sum()} cells with NaN labels. These cells will be excluded from kBET computation.",
+            UserWarning,
+        )
+        valid = ~nan_mask
+        labels = labels[valid]
+        batches = batches[valid]
+        conn_graph = conn_graph[valid][:, valid]
+
     # prepare call of kBET per cluster
     kbet_scores = {"cluster": [], "kBET": []}
     for clus in np.unique(labels):
