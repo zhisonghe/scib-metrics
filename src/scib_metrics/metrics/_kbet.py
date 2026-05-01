@@ -1,5 +1,7 @@
 import logging
+import warnings
 from functools import partial
+from typing import Literal
 
 import chex
 import jax
@@ -13,6 +15,80 @@ from scib_metrics.nearest_neighbors import NeighborsResults
 from scib_metrics.utils import diffusion_nn, get_ndarray
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# GPU (PyTorch) availability helper
+# ---------------------------------------------------------------------------
+
+
+def _kbet_gpu_available() -> bool:
+    """Return True when PyTorch with CUDA support is importable and a GPU is present."""
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return False
+        # torch.special.gammainc was added in PyTorch 1.8
+        if not hasattr(torch.special, "gammainc"):
+            return False
+        return True
+    except ImportError:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# PyTorch GPU kBET kernel
+# ---------------------------------------------------------------------------
+
+
+def _kbet_torch(neigh_batch_ids: np.ndarray, batches: np.ndarray, n_batches: int):
+    """Compute kBET chi-square statistics and p-values on GPU via PyTorch.
+
+    Parameters
+    ----------
+    neigh_batch_ids
+        Integer array of shape (n_cells, k) — batch ID for each neighbor.
+    batches
+        Integer array of shape (n_cells,) — batch ID per cell.
+    n_batches
+        Total number of distinct batches.
+
+    Returns
+    -------
+    test_statistics
+        Chi-square statistic per cell, shape (n_cells,).
+    p_values
+        p-value per cell, shape (n_cells,).
+    """
+    import torch
+
+    device = torch.device("cuda")
+    t_neigh = torch.as_tensor(neigh_batch_ids, dtype=torch.long, device=device)  # (n_cells, k)
+    t_batches = torch.as_tensor(batches, dtype=torch.long, device=device)  # (n_cells,)
+
+    n_cells, k = t_neigh.shape
+
+    # Global expected frequency of each batch
+    expected_freq = torch.bincount(t_batches, minlength=n_batches).float()
+    expected_freq = expected_freq / expected_freq.sum()  # (n_batches,)
+
+    # Observed counts: for each cell, how many of its k neighbors belong to each batch
+    observed = torch.zeros(n_cells, n_batches, dtype=torch.float32, device=device)
+    observed.scatter_add_(1, t_neigh, torch.ones(n_cells, k, dtype=torch.float32, device=device))
+
+    # Expected counts per cell
+    expected_counts = expected_freq * k  # (n_batches,) broadcast over cells
+
+    # Chi-squared statistic (cells × batches summed to cells)
+    dof = n_batches - 1
+    test_statistics = ((observed - expected_counts) ** 2 / expected_counts).sum(dim=1)  # (n_cells,)
+
+    # p-value = 1 - chi2_cdf(dof, stat) = 1 - regularized_lower_gamma(dof/2, stat/2)
+    a = torch.tensor(dof / 2.0, dtype=torch.float32, device=device)
+    p_values = 1.0 - torch.special.gammainc(a, test_statistics / 2.0)
+
+    return test_statistics.cpu().numpy(), p_values.cpu().numpy()
 
 
 def _chi2_cdf(df: int | NdArray, x: NdArray) -> float:
@@ -38,7 +114,12 @@ def _kbet(neigh_batch_ids: jnp.ndarray, batches: jnp.ndarray, n_batches: int) ->
     return test_statistics, p_values
 
 
-def kbet(X: NeighborsResults, batches: np.ndarray, alpha: float = 0.05) -> float:
+def kbet(
+    X: NeighborsResults,
+    batches: np.ndarray,
+    alpha: float = 0.05,
+    flavor: Literal["auto", "cpu", "gpu"] = "auto",
+) -> float:
     """Compute kbet :cite:p:`buttner2018`.
 
     This implementation is inspired by the implementation in Pegasus:
@@ -61,6 +142,12 @@ def kbet(X: NeighborsResults, batches: np.ndarray, alpha: float = 0.05) -> float
         for each cell.
     alpha
         Significance level for the statistical test.
+    flavor
+        Which backend to use for computation.  ``"auto"`` (default) selects
+        ``"gpu"`` when a CUDA-capable GPU is available (via PyTorch), and falls
+        back to ``"cpu"`` otherwise.  ``"cpu"`` forces the JAX CPU backend.
+        ``"gpu"`` forces the PyTorch CUDA backend (raises ``RuntimeError`` if
+        no GPU is found).
 
     Returns
     -------
@@ -77,12 +164,25 @@ def kbet(X: NeighborsResults, batches: np.ndarray, alpha: float = 0.05) -> float
     batches = np.asarray(pd.Categorical(batches).codes)
     neigh_batch_ids = batches[knn_idx]
     chex.assert_equal_shape([neigh_batch_ids, knn_idx])
-    n_batches = jnp.unique(batches).shape[0]
-    test_statistics, p_values = _kbet(neigh_batch_ids, batches, n_batches)
-    test_statistics = get_ndarray(test_statistics)
-    p_values = get_ndarray(p_values)
-    acceptance_rate = (p_values >= alpha).mean()
+    n_batches = len(np.unique(batches))
 
+    use_gpu = (flavor == "gpu") or (flavor == "auto" and _kbet_gpu_available())
+    if flavor == "gpu" and not _kbet_gpu_available():
+        raise RuntimeError(
+            "flavor='gpu' requested but PyTorch CUDA is not available. "
+            "Install torch with CUDA support or use flavor='auto'/'cpu'."
+        )
+
+    if use_gpu:
+        test_statistics, p_values = _kbet_torch(neigh_batch_ids, batches, n_batches)
+    else:
+        test_statistics, p_values = _kbet(
+            jnp.array(neigh_batch_ids), jnp.array(batches), n_batches
+        )
+        test_statistics = get_ndarray(test_statistics)
+        p_values = get_ndarray(p_values)
+
+    acceptance_rate = (p_values >= alpha).mean()
     return acceptance_rate, test_statistics, p_values
 
 
@@ -93,6 +193,7 @@ def kbet_per_label(
     alpha: float = 0.05,
     diffusion_n_comps: int = 100,
     return_df: bool = False,
+    flavor: Literal["auto", "cpu", "gpu"] = "auto",
 ) -> float | tuple[float, pd.DataFrame]:
     """Compute kBET score per cell type label as in :cite:p:`luecken2022benchmarking`.
 
@@ -108,12 +209,19 @@ def kbet_per_label(
     batches
         Array of shape (n_cells,) representing batch values
         for each cell.
+    labels
+        Array of shape (n_cells,) representing cell type labels.
     alpha
         Significance level for the statistical test.
     diffusion_n_comps
         Number of diffusion components to use for diffusion distance approximation.
     return_df
         Return dataframe of results in addition to score.
+    flavor
+        Which backend to use for computation.  ``"auto"`` (default) selects
+        ``"gpu"`` when a CUDA-capable GPU is available (via PyTorch), and falls
+        back to ``"cpu"`` otherwise.  Forwarded to each internal call of
+        :func:`kbet`.
 
     Returns
     -------
@@ -140,7 +248,6 @@ def kbet_per_label(
     # Drop cells with NaN labels
     nan_mask = np.array([v is None or (isinstance(v, float) and np.isnan(v)) for v in labels], dtype=bool)
     if nan_mask.any():
-        import warnings
         warnings.warn(
             f"Found {nan_mask.sum()} cells with NaN labels. These cells will be excluded from kBET computation.",
             UserWarning,
@@ -182,6 +289,7 @@ def kbet_per_label(
                         nn_graph_sub,
                         batches=batches_sub,
                         alpha=alpha,
+                        flavor=flavor,
                     )
                 except ValueError:
                     logger.info("Diffusion distance failed. Skip.")
@@ -208,6 +316,7 @@ def kbet_per_label(
                             nn_results_sub_sub,
                             batches=batches_sub[idx_nonan],
                             alpha=alpha,
+                            flavor=flavor,
                         )
                     except ValueError:
                         logger.info("Diffusion distance failed. Skip.")
