@@ -12,6 +12,11 @@ logger = logging.getLogger(__name__)
 _EPS = 1e-8
 
 
+# ---------------------------------------------------------------------------
+# CPU (scipy) helpers
+# ---------------------------------------------------------------------------
+
+
 def _compute_transitions(X: csr_matrix, density_normalize: bool = True):
     """Code from scanpy.
 
@@ -91,7 +96,83 @@ def _get_sparse_matrix_from_indices_distances_numpy(indices, distances, n_obs, n
     return D
 
 
-def diffusion_nn(X: csr_matrix, k: int, n_comps: int = 100) -> nearest_neighbors.NeighborsResults:
+# ---------------------------------------------------------------------------
+# GPU (cupy / cuml) helpers
+# ---------------------------------------------------------------------------
+
+
+def _diffusion_nn_gpu_available() -> bool:
+    """Return True when cupy and cuml are importable."""
+    try:
+        import cupy  # noqa: F401
+        import cupyx.scipy.sparse  # noqa: F401
+        import cupyx.scipy.sparse.linalg  # noqa: F401
+        import cuml.neighbors  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+def _compute_transitions_gpu(X: csr_matrix, density_normalize: bool = True):
+    """GPU version of :func:`_compute_transitions` using cupy sparse."""
+    import cupy as cp
+    import cupyx.scipy.sparse as cpsparse
+
+    # Move sparse matrix to GPU
+    X_gpu = cpsparse.csr_matrix(X.astype(np.float32))
+
+    if density_normalize:
+        q = cp.asarray(X_gpu.sum(axis=0)).ravel()
+        Q = cpsparse.diags(1.0 / q)
+        K = Q @ X_gpu @ Q
+    else:
+        K = X_gpu
+
+    z = cp.sqrt(cp.asarray(K.sum(axis=0))).ravel()
+    Z = cpsparse.diags(1.0 / z)
+    transitions_sym = Z @ K @ Z
+
+    return transitions_sym
+
+
+def _compute_eigen_gpu(transitions_sym, n_comps: int = 15):
+    """GPU eigen decomposition via cupy, returns numpy arrays."""
+    import cupy as cp
+    import cupyx.scipy.sparse.linalg as cpsla
+
+    n_comps = min(transitions_sym.shape[0] - 1, n_comps)
+    # eigsh requires float64 for numerical stability
+    transitions_sym = transitions_sym.astype(cp.float64)
+    evals, evecs = cpsla.eigsh(transitions_sym, k=n_comps, which="LM")
+
+    # Sort by decreasing eigenvalue
+    idx = cp.argsort(evals)[::-1]
+    evals = evals[idx].astype(cp.float32)
+    evecs = evecs[:, idx].astype(cp.float32)
+
+    return cp.asnumpy(evals), cp.asnumpy(evecs)
+
+
+def _cuml_nn(embedding: np.ndarray, n_neighbors: int) -> nearest_neighbors.NeighborsResults:
+    """Exact GPU nearest-neighbor search via cuML."""
+    import cuml.neighbors
+
+    nn = cuml.neighbors.NearestNeighbors(n_neighbors=n_neighbors, metric="euclidean", output_type="numpy")
+    nn.fit(embedding)
+    distances, indices = nn.kneighbors(embedding)
+    # cuML may return cupy arrays depending on global_output_type; coerce to numpy
+    distances = np.asarray(distances)
+    indices = np.asarray(indices, dtype=np.intp)
+    return nearest_neighbors.NeighborsResults(indices=indices, distances=distances)
+
+
+def diffusion_nn(
+    X: csr_matrix,
+    k: int,
+    n_comps: int = 100,
+    flavor: Literal["auto", "cpu", "gpu"] = "auto",
+) -> nearest_neighbors.NeighborsResults:
     """Diffusion-based neighbors.
 
     This function generates a nearest neighbour list from a connectivities matrix.
@@ -109,19 +190,40 @@ def diffusion_nn(X: csr_matrix, k: int, n_comps: int = 100) -> nearest_neighbors
     k
         Number of nearest neighbours to select.
     n_comps
-        Number of components for diffusion map
+        Number of components for diffusion map.
+    flavor
+        Which backend to use.  ``"auto"`` (default) selects ``"gpu"`` when
+        cupy and cuML are available, and falls back to ``"cpu"`` otherwise.
+        ``"cpu"`` forces the scipy/pynndescent path.  ``"gpu"`` forces the
+        cupy/cuML path (raises ``RuntimeError`` if dependencies are missing).
 
     Returns
     -------
     Neighbors results
     """
-    transitions = _compute_transitions(X)
-    evals, evecs = _compute_eigen(transitions, n_comps=n_comps)
+    use_gpu = (flavor == "gpu") or (flavor == "auto" and _diffusion_nn_gpu_available())
+    if flavor == "gpu" and not _diffusion_nn_gpu_available():
+        raise RuntimeError(
+            "flavor='gpu' requested but cupy or cuml is not available. "
+            "Install them or use flavor='auto'/'cpu'."
+        )
+
+    if use_gpu:
+        transitions = _compute_transitions_gpu(X)
+        evals, evecs = _compute_eigen_gpu(transitions, n_comps=n_comps)
+    else:
+        transitions = _compute_transitions(X)
+        evals, evecs = _compute_eigen(transitions, n_comps=n_comps)
+
     evals += _EPS  # Avoid division by zero
     # Multiscale such that the number of steps t gets "integrated out"
     embedding = evecs
     scaled_evals = np.array([e if e == 1 else e / (1 - e) for e in evals])
     embedding *= scaled_evals
-    nn_result = nearest_neighbors.pynndescent(embedding, n_neighbors=k + 1)
+
+    if use_gpu:
+        nn_result = _cuml_nn(embedding, n_neighbors=k + 1)
+    else:
+        nn_result = nearest_neighbors.pynndescent(embedding, n_neighbors=k + 1)
 
     return nn_result

@@ -221,7 +221,9 @@ def kbet_per_label(
         Which backend to use for computation.  ``"auto"`` (default) selects
         ``"torch"`` when a CUDA-capable GPU is available (via PyTorch), and
         falls back to ``"jax"`` otherwise.  Forwarded to each internal call
-        of :func:`kbet`.
+        of :func:`kbet` and controls the ``diffusion_nn`` backend as well
+        (``"torch"`` → cupy/cuML diffusion + PyTorch chi-square;
+        ``"jax"`` → scipy/pynndescent diffusion + JAX chi-square).
 
     Returns
     -------
@@ -283,7 +285,8 @@ def kbet_per_label(
             if n_comp == 1:  # a single component to compute kBET on
                 try:
                     diffusion_n_comps = np.min([diffusion_n_comps, n_obs - 1])
-                    nn_graph_sub = diffusion_nn(conn_graph_sub, k=k0, n_comps=diffusion_n_comps)
+                    _diffusion_flavor = "cpu" if flavor == "jax" else ("gpu" if flavor == "torch" else "auto")
+                    nn_graph_sub = diffusion_nn(conn_graph_sub, k=k0, n_comps=diffusion_n_comps, flavor=_diffusion_flavor)
                     # call kBET
                     score, _, _ = kbet(
                         nn_graph_sub,
@@ -310,7 +313,8 @@ def kbet_per_label(
 
                     try:
                         diffusion_n_comps = np.min([diffusion_n_comps, conn_graph_sub_sub.shape[0] - 1])
-                        nn_results_sub_sub = diffusion_nn(conn_graph_sub_sub, k=k0, n_comps=diffusion_n_comps)
+                        _diffusion_flavor = "cpu" if flavor == "jax" else ("gpu" if flavor == "torch" else "auto")
+                        nn_results_sub_sub = diffusion_nn(conn_graph_sub_sub, k=k0, n_comps=diffusion_n_comps, flavor=_diffusion_flavor)
                         # call kBET
                         score, _, _ = kbet(
                             nn_results_sub_sub,
