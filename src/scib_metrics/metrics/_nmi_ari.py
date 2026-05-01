@@ -330,18 +330,29 @@ def nmi_ari_cluster_labels_leiden(
 
     if use_gpu:
         # GPU path: serial resolution search (CUDA context is not fork-safe with joblib)
-        if optimize_resolution:
-            n = 10
-            resolutions = np.array([2 * x / n for x in range(1, n + 1)])
-            out = [
-                _compute_nmi_ari_cluster_labels_gpu(conn_graph, labels, r, seed=seed) for r in resolutions
-            ]
-            nmi_ari = np.array(out)
-            nmi_ind = np.argmax(nmi_ari[:, 0])
-            nmi, ari = nmi_ari[nmi_ind, :]
-        else:
-            nmi, ari = _compute_nmi_ari_cluster_labels_gpu(conn_graph, labels, resolution, seed=seed)
-        return {"nmi": float(nmi), "ari": float(ari)}
+        try:
+            if optimize_resolution:
+                n = 10
+                resolutions = np.array([2 * x / n for x in range(1, n + 1)])
+                out = [
+                    _compute_nmi_ari_cluster_labels_gpu(conn_graph, labels, r, seed=seed) for r in resolutions
+                ]
+                nmi_ari = np.array(out)
+                nmi_ind = np.argmax(nmi_ari[:, 0])
+                nmi, ari = nmi_ari[nmi_ind, :]
+            else:
+                nmi, ari = _compute_nmi_ari_cluster_labels_gpu(conn_graph, labels, resolution, seed=seed)
+            return {"nmi": float(nmi), "ari": float(ari)}
+        except RuntimeError as e:
+            if "out_of_memory" in str(e) or "bad_alloc" in str(e) or "cudaErrorMemoryAllocation" in str(e):
+                warnings.warn(
+                    f"GPU out-of-memory during Leiden NMI/ARI computation ({e}). "
+                    "Falling back to CPU path.",
+                    RuntimeWarning,
+                )
+                use_gpu = False
+            else:
+                raise
 
     # CPU path
     if optimize_resolution:
