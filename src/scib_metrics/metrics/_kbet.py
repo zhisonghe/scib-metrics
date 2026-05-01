@@ -91,6 +91,26 @@ def _kbet_torch(neigh_batch_ids: np.ndarray, batches: np.ndarray, n_batches: int
     return test_statistics.cpu().numpy(), p_values.cpu().numpy()
 
 
+def _flush_gpu_memory() -> None:
+    """Best-effort release of all cached GPU memory (cupy pools + torch cache)."""
+    try:
+        import cupy as cp
+        cp.get_default_memory_pool().free_all_blocks()
+        cp.get_default_pinned_memory_pool().free_all_blocks()
+    except Exception:
+        pass
+    try:
+        import torch
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def _is_oom_error(e: Exception) -> bool:
+    msg = str(e)
+    return any(s in msg for s in ("out_of_memory", "bad_alloc", "cudaErrorMemoryAllocation"))
+
+
 def _chi2_cdf(df: int | NdArray, x: NdArray) -> float:
     """Chi2 cdf.
 
@@ -174,8 +194,20 @@ def kbet(
         )
 
     if use_gpu:
-        test_statistics, p_values = _kbet_torch(neigh_batch_ids, batches, n_batches)
-    else:
+        try:
+            test_statistics, p_values = _kbet_torch(neigh_batch_ids, batches, n_batches)
+        except RuntimeError as e:
+            if _is_oom_error(e):
+                _flush_gpu_memory()
+                warnings.warn(
+                    f"GPU out-of-memory in kbet() ({e}). Falling back to JAX CPU path.",
+                    RuntimeWarning,
+                )
+                use_gpu = False
+            else:
+                raise
+
+    if not use_gpu:
         test_statistics, p_values = _kbet(
             jnp.array(neigh_batch_ids), jnp.array(batches), n_batches
         )
@@ -297,6 +329,22 @@ def kbet_per_label(
                 except ValueError:
                     logger.info("Diffusion distance failed. Skip.")
                     score = 0  # i.e. 100% rejection
+                except RuntimeError as e:
+                    if _is_oom_error(e):
+                        _flush_gpu_memory()
+                        warnings.warn(
+                            f"GPU out-of-memory for cluster '{clus}' in kbet_per_label() ({e}). "
+                            "Falling back to CPU path for this cluster.",
+                            RuntimeWarning,
+                        )
+                        try:
+                            nn_graph_sub = diffusion_nn(conn_graph_sub, k=k0, n_comps=diffusion_n_comps, flavor="cpu")
+                            score, _, _ = kbet(nn_graph_sub, batches=batches_sub, alpha=alpha, flavor="jax")
+                        except ValueError:
+                            logger.info("Diffusion distance failed on CPU fallback. Skip.")
+                            score = 0
+                    else:
+                        raise
 
             else:
                 # check the number of components where kBET can be computed upon
@@ -325,6 +373,22 @@ def kbet_per_label(
                     except ValueError:
                         logger.info("Diffusion distance failed. Skip.")
                         score = 0  # i.e. 100% rejection
+                    except RuntimeError as e:
+                        if _is_oom_error(e):
+                            _flush_gpu_memory()
+                            warnings.warn(
+                                f"GPU out-of-memory for cluster '{clus}' in kbet_per_label() ({e}). "
+                                "Falling back to CPU path for this cluster.",
+                                RuntimeWarning,
+                            )
+                            try:
+                                nn_results_sub_sub = diffusion_nn(conn_graph_sub_sub, k=k0, n_comps=diffusion_n_comps, flavor="cpu")
+                                score, _, _ = kbet(nn_results_sub_sub, batches=batches_sub[idx_nonan], alpha=alpha, flavor="jax")
+                            except ValueError:
+                                logger.info("Diffusion distance failed on CPU fallback. Skip.")
+                                score = 0
+                        else:
+                            raise
                 else:  # if there are too many too small connected components, set kBET score to 0
                     score = 0  # i.e. 100% rejection
 
