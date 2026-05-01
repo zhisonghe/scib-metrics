@@ -64,8 +64,8 @@ def _kbet_torch(neigh_batch_ids: np.ndarray, batches: np.ndarray, n_batches: int
     import torch
 
     device = torch.device("cuda")
-    t_neigh = torch.as_tensor(neigh_batch_ids, dtype=torch.long, device=device)  # (n_cells, k)
-    t_batches = torch.as_tensor(batches, dtype=torch.long, device=device)  # (n_cells,)
+    t_neigh = torch.tensor(np.ascontiguousarray(neigh_batch_ids), dtype=torch.long, device=device)  # (n_cells, k)
+    t_batches = torch.tensor(np.ascontiguousarray(batches), dtype=torch.long, device=device)  # (n_cells,)
 
     n_cells, k = t_neigh.shape
 
