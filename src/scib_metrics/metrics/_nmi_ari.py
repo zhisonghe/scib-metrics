@@ -1,9 +1,11 @@
 import logging
 import random
 import warnings
+from typing import Literal
 
 import igraph
 import numpy as np
+import pandas as pd
 from scipy.sparse import spmatrix
 from sklearn.metrics.cluster import adjusted_rand_score, normalized_mutual_info_score
 from sklearn.utils import check_array
@@ -53,7 +55,147 @@ def _compute_nmi_ari_cluster_labels(
     return nmi, ari
 
 
-def nmi_ari_cluster_labels_kmeans(X: np.ndarray, labels: np.ndarray) -> dict[str, float]:
+# ---------------------------------------------------------------------------
+# GPU availability helpers
+# ---------------------------------------------------------------------------
+
+
+def _leiden_gpu_available() -> bool:
+    """Return True when cugraph + cudf + torch CUDA + torchmetrics are all importable."""
+    try:
+        import cudf  # noqa: F401
+        import cugraph  # noqa: F401
+        import torch
+        from torchmetrics.functional.clustering import normalized_mutual_info_score as _  # noqa: F401
+
+        return torch.cuda.is_available()
+    except ImportError:
+        return False
+
+
+def _kmeans_gpu_available() -> bool:
+    """Return True when cuml + torch CUDA + torchmetrics are all importable."""
+    try:
+        from cuml.cluster import KMeans as _  # noqa: F401
+        import torch
+        from torchmetrics.functional.clustering import normalized_mutual_info_score as _  # noqa: F401
+
+        return torch.cuda.is_available()
+    except ImportError:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# GPU clustering helpers
+# ---------------------------------------------------------------------------
+
+
+def _compute_clustering_leiden_gpu(connectivity_graph: spmatrix, resolution: float, seed: int) -> np.ndarray:
+    """GPU-accelerated Leiden clustering via cugraph.
+
+    Parameters
+    ----------
+    connectivity_graph
+        Symmetric sparse connectivity matrix (n_cells × n_cells).
+    resolution
+        Leiden resolution parameter.
+    seed
+        Random seed for reproducibility.
+
+    Returns
+    -------
+    Cluster membership array of length n_cells.
+    """
+    import cudf
+    import cugraph
+
+    n = connectivity_graph.shape[0]
+    cx = connectivity_graph.tocoo()
+    edge_df = cudf.DataFrame(
+        {
+            "src": cudf.Series(cx.row.astype("int32")),
+            "dst": cudf.Series(cx.col.astype("int32")),
+            "weight": cudf.Series(cx.data.astype("float32")),
+        }
+    )
+    G = cugraph.Graph()
+    G.from_cudf_edgelist(edge_df, source="src", destination="dst", edge_attr="weight")
+    parts, _ = cugraph.leiden(G, resolution=float(resolution), random_state=seed)
+    # Merge against full vertex range to handle any isolated vertex edge-cases
+    all_v = cudf.DataFrame({"vertex": cudf.Series(np.arange(n, dtype="int32"))})
+    parts = all_v.merge(parts, on="vertex", how="left").sort_values("vertex").reset_index(drop=True)
+    return parts["partition"].to_numpy()
+
+
+def _compute_clustering_kmeans_gpu(X: np.ndarray, n_clusters: int) -> np.ndarray:
+    """GPU-accelerated k-means clustering via cuml.
+
+    Parameters
+    ----------
+    X
+        2-D feature matrix.
+    n_clusters
+        Number of clusters (k).
+
+    Returns
+    -------
+    Cluster label array of length n_cells.
+    """
+    from cuml.cluster import KMeans as cuKMeans
+
+    kmeans = cuKMeans(n_clusters=n_clusters)
+    kmeans.fit(X)
+    labels = kmeans.labels_
+    # cuml returns cupy arrays; convert to numpy
+    if hasattr(labels, "get"):
+        return labels.get()
+    return np.asarray(labels)
+
+
+def _compute_nmi_ari_gpu(labels_true: np.ndarray, labels_pred: np.ndarray) -> tuple[float, float]:
+    """Compute NMI and ARI on GPU via torchmetrics.
+
+    Parameters
+    ----------
+    labels_true
+        Ground-truth label array (may contain strings).
+    labels_pred
+        Predicted integer cluster label array.
+
+    Returns
+    -------
+    (nmi, ari) as Python floats.
+    """
+    import torch
+    from torchmetrics.functional.clustering import adjusted_rand_score as tm_ari
+    from torchmetrics.functional.clustering import normalized_mutual_info_score as tm_nmi
+
+    # Encode ground-truth labels to contiguous integers (handles string labels)
+    labels_true_int = np.asarray(pd.Categorical(labels_true).codes, dtype="int64")
+    device = torch.device("cuda")
+    t_true = torch.tensor(labels_true_int, dtype=torch.long, device=device)
+    t_pred = torch.tensor(np.asarray(labels_pred, dtype="int64"), dtype=torch.long, device=device)
+
+    nmi = tm_nmi(t_pred, t_true, average_method="arithmetic").item()
+    ari = tm_ari(t_pred, t_true).item()
+    return float(nmi), float(ari)
+
+
+def _compute_nmi_ari_cluster_labels_gpu(
+    X: spmatrix,
+    labels: np.ndarray,
+    resolution: float = 1.0,
+    seed: int = 42,
+) -> tuple[float, float]:
+    labels_pred = _compute_clustering_leiden_gpu(X, resolution, seed)
+    return _compute_nmi_ari_gpu(labels, labels_pred)
+
+
+def nmi_ari_cluster_labels_kmeans(
+    X: np.ndarray,
+    labels: np.ndarray,
+    flavor: Literal["auto", "cpu", "gpu"] = "auto",
+) -> dict[str, float]:
     """Compute nmi and ari between k-means clusters and labels.
 
     This deviates from the original implementation in scib by using k-means
@@ -66,6 +208,14 @@ def nmi_ari_cluster_labels_kmeans(X: np.ndarray, labels: np.ndarray) -> dict[str
         Array of shape (n_cells, n_features).
     labels
         Array of shape (n_cells,) representing label values
+    flavor
+        Compute backend to use.
+
+        - ``'cpu'``: scikit-learn KMeans + sklearn NMI/ARI (default CPU path).
+        - ``'gpu'``: cuML KMeans + torchmetrics NMI/ARI on CUDA. Requires
+          ``cuml``, ``torch`` with CUDA, and ``torchmetrics``.
+        - ``'auto'``: use GPU when all required packages are available,
+          otherwise fall back to CPU silently.
 
     Returns
     -------
@@ -85,12 +235,24 @@ def nmi_ari_cluster_labels_kmeans(X: np.ndarray, labels: np.ndarray) -> dict[str
         )
         labels = labels[valid_mask]
         X = X[valid_mask]
-    n_clusters = len(np.unique(labels))
-    labels_pred = _compute_clustering_kmeans(X, n_clusters)
-    nmi = normalized_mutual_info_score(labels, labels_pred, average_method="arithmetic")
-    ari = adjusted_rand_score(labels, labels_pred)
 
-    return {"nmi": nmi, "ari": ari}
+    if flavor == "gpu" and not _kmeans_gpu_available():
+        raise RuntimeError(
+            "flavor='gpu' requested for nmi_ari_cluster_labels_kmeans but one or more required packages "
+            "(cuml, torch with CUDA, torchmetrics) are not available."
+        )
+    use_gpu = (flavor == "gpu") or (flavor == "auto" and _kmeans_gpu_available())
+
+    n_clusters = len(np.unique(labels))
+    if use_gpu:
+        labels_pred = _compute_clustering_kmeans_gpu(X, n_clusters)
+        nmi, ari = _compute_nmi_ari_gpu(labels, labels_pred)
+    else:
+        labels_pred = _compute_clustering_kmeans(X, n_clusters)
+        nmi = normalized_mutual_info_score(labels, labels_pred, average_method="arithmetic")
+        ari = adjusted_rand_score(labels, labels_pred)
+
+    return {"nmi": float(nmi), "ari": float(ari)}
 
 
 def nmi_ari_cluster_labels_leiden(
@@ -100,6 +262,7 @@ def nmi_ari_cluster_labels_leiden(
     resolution: float = 1.0,
     n_jobs: int = 1,
     seed: int = 42,
+    flavor: Literal["auto", "cpu", "gpu"] = "auto",
 ) -> dict[str, float]:
     """Compute nmi and ari between leiden clusters and labels.
 
@@ -120,9 +283,18 @@ def nmi_ari_cluster_labels_leiden(
         Resolution parameter of leiden clustering. Only used if optimize_resolution is False.
     n_jobs
         Number of jobs for parallelizing resolution optimization via joblib. If -1, all CPUs
-        are used.
+        are used. Ignored when ``flavor='gpu'``.
     seed
         Seed used for reproducibility of clustering.
+    flavor
+        Compute backend to use.
+
+        - ``'cpu'``: igraph Leiden + sklearn NMI/ARI (default CPU path, supports joblib).
+        - ``'gpu'``: cugraph Leiden + torchmetrics NMI/ARI on CUDA. Requires
+          ``cugraph``, ``cudf``, ``torch`` with CUDA, and ``torchmetrics``.
+          Resolution optimisation runs serially (CUDA fork-safety).
+        - ``'auto'``: use GPU when all required packages are available,
+          otherwise fall back to CPU silently.
 
     Returns
     -------
@@ -142,6 +314,30 @@ def nmi_ari_cluster_labels_leiden(
         )
         labels = labels[valid_mask]
         conn_graph = conn_graph[valid_mask][:, valid_mask]
+
+    if flavor == "gpu" and not _leiden_gpu_available():
+        raise RuntimeError(
+            "flavor='gpu' requested for nmi_ari_cluster_labels_leiden but one or more required packages "
+            "(cugraph, cudf, torch with CUDA, torchmetrics) are not available."
+        )
+    use_gpu = (flavor == "gpu") or (flavor == "auto" and _leiden_gpu_available())
+
+    if use_gpu:
+        # GPU path: serial resolution search (CUDA context is not fork-safe with joblib)
+        if optimize_resolution:
+            n = 10
+            resolutions = np.array([2 * x / n for x in range(1, n + 1)])
+            out = [
+                _compute_nmi_ari_cluster_labels_gpu(conn_graph, labels, r, seed=seed) for r in resolutions
+            ]
+            nmi_ari = np.array(out)
+            nmi_ind = np.argmax(nmi_ari[:, 0])
+            nmi, ari = nmi_ari[nmi_ind, :]
+        else:
+            nmi, ari = _compute_nmi_ari_cluster_labels_gpu(conn_graph, labels, resolution, seed=seed)
+        return {"nmi": float(nmi), "ari": float(ari)}
+
+    # CPU path
     if optimize_resolution:
         n = 10
         resolutions = np.array([2 * x / n for x in range(1, n + 1)])
@@ -157,8 +353,8 @@ def nmi_ari_cluster_labels_leiden(
         nmi_ari = np.array(out)
         nmi_ind = np.argmax(nmi_ari[:, 0])
         nmi, ari = nmi_ari[nmi_ind, :]
-        return {"nmi": nmi, "ari": ari}
+        return {"nmi": float(nmi), "ari": float(ari)}
     else:
         nmi, ari = _compute_nmi_ari_cluster_labels(conn_graph, labels, resolution, seed=seed)
 
-    return {"nmi": nmi, "ari": ari}
+    return {"nmi": float(nmi), "ari": float(ari)}
