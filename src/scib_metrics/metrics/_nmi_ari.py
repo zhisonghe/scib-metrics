@@ -124,15 +124,13 @@ def _compute_clustering_leiden_gpu(connectivity_graph: spmatrix, resolution: flo
     # Merge against full vertex range to handle any isolated vertex edge-cases
     all_v = cudf.DataFrame({"vertex": cudf.Series(np.arange(n, dtype="int32"))})
     parts = all_v.merge(parts, on="vertex", how="left").sort_values("vertex").reset_index(drop=True)
-    # Isolated vertices (not returned by leiden) have NaN partition — assign each
-    # its own unique singleton cluster so the cast to int never hits NaN.
-    nan_mask = parts["partition"].isna()
+    # to_numpy() on an int column with NaN entries yields float64; fix in numpy
+    arr = parts["partition"].to_numpy()  # float64, NaN where vertex was isolated
+    nan_mask = np.isnan(arr)
     if nan_mask.any():
-        n_missing = int(nan_mask.sum())
-        next_id = int(parts["partition"].max()) + 1
-        fill_ids = cudf.Series(np.arange(next_id, next_id + n_missing, dtype="int32"))
-        parts["partition"] = parts["partition"].where(~nan_mask, fill_ids)
-    return parts["partition"].astype("int32").to_numpy()
+        next_id = int(np.nanmax(arr)) + 1
+        arr[nan_mask] = np.arange(next_id, next_id + int(nan_mask.sum()))
+    return arr.astype("int32")
 
 
 def _compute_clustering_kmeans_gpu(X: np.ndarray, n_clusters: int) -> np.ndarray:
