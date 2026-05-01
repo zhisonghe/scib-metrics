@@ -14,6 +14,15 @@ from scib_metrics.utils import KMeans
 logger = logging.getLogger(__name__)
 
 
+def _nan_mask(labels: np.ndarray) -> np.ndarray:
+    """Return a boolean mask that is True where labels are NaN/None."""
+    try:
+        return np.isnan(labels.astype(float))
+    except (ValueError, TypeError):
+        # Object arrays (strings, etc.): check for None / float NaN entries
+        return np.array([v is None or (isinstance(v, float) and np.isnan(v)) for v in labels], dtype=bool)
+
+
 def _compute_clustering_kmeans(X: np.ndarray, n_clusters: int) -> np.ndarray:
     kmeans = KMeans(n_clusters)
     kmeans.fit(X)
@@ -66,6 +75,16 @@ def nmi_ari_cluster_labels_kmeans(X: np.ndarray, labels: np.ndarray) -> dict[str
         Adjusted rand index score
     """
     X = check_array(X, accept_sparse=False, ensure_2d=True)
+    labels = np.asarray(labels)
+    valid_mask = ~_nan_mask(labels)
+    if not valid_mask.all():
+        n_nan = (~valid_mask).sum()
+        warnings.warn(
+            f"Found {n_nan} cells with NaN labels. These cells will be excluded from NMI/ARI computation.",
+            UserWarning,
+        )
+        labels = labels[valid_mask]
+        X = X[valid_mask]
     n_clusters = len(np.unique(labels))
     labels_pred = _compute_clustering_kmeans(X, n_clusters)
     nmi = normalized_mutual_info_score(labels, labels_pred, average_method="arithmetic")
@@ -113,6 +132,16 @@ def nmi_ari_cluster_labels_leiden(
         Adjusted rand index score
     """
     conn_graph = X.knn_graph_connectivities
+    labels = np.asarray(labels)
+    valid_mask = ~_nan_mask(labels)
+    if not valid_mask.all():
+        n_nan = (~valid_mask).sum()
+        warnings.warn(
+            f"Found {n_nan} cells with NaN labels. These cells will be excluded from NMI/ARI computation.",
+            UserWarning,
+        )
+        labels = labels[valid_mask]
+        conn_graph = conn_graph[valid_mask][:, valid_mask]
     if optimize_resolution:
         n = 10
         resolutions = np.array([2 * x / n for x in range(1, n + 1)])
