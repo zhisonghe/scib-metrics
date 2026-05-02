@@ -21,7 +21,7 @@ from sklearn.preprocessing import MinMaxScaler
 from tqdm import tqdm
 
 import scib_metrics
-from scib_metrics.nearest_neighbors import NeighborsResults, pynndescent
+from scib_metrics.nearest_neighbors import NeighborsResults, cuml_available, cuml_nndescent, pynndescent
 from scib_metrics.utils import convert_knn_graph_to_idx
 
 Kwargs = dict[str, Any]
@@ -143,6 +143,12 @@ class Benchmarker:
         :meth:`~scib_metrics.benchmark.Benchmarker.benchmark`.
     solver
         SVD solver to use during PCA. can help stability issues. Choose from: "arpack", "randomized" or "auto"
+    neighbor_flavor
+        Backend for the neighbor graph computation in :meth:`prepare`.  One of
+        ``"auto"`` (default), ``"cpu"``, or ``"gpu"``.  ``"auto"`` uses
+        ``cuml`` when it is available and falls back to ``pynndescent``
+        otherwise.  ``"gpu"`` forces cuML and raises ``RuntimeError`` if it
+        is not installed.  ``"cpu"`` always uses ``pynndescent``.
 
     Notes
     -----
@@ -168,6 +174,7 @@ class Benchmarker:
         n_jobs: int = 1,
         progress_bar: bool = True,
         solver: str = "arpack",
+        neighbor_flavor: str = "auto",
     ):
         self._adata = adata
         self._embedding_obsm_keys = list(embedding_obsm_keys) if embedding_obsm_keys is not None else []
@@ -214,6 +221,7 @@ class Benchmarker:
         self._progress_bar = progress_bar
         self._compute_neighbors = True
         self._solver = solver
+        self._neighbor_flavor = neighbor_flavor
 
         if self._bio_conservation_metrics is None and self._batch_correction_metrics is None:
             raise ValueError("Either batch or bio metrics must be defined.")
@@ -309,9 +317,10 @@ class Benchmarker:
         ----------
         neighbor_computer
             Function that computes the neighbors of the data. If `None`, the neighbors will be computed
-            with :func:`~scib_metrics.utils.nearest_neighbors.pynndescent`. The function should take as input
-            the data and the number of neighbors to compute and return a :class:`~scib_metrics.utils.nearest_neighbors.NeighborsResults`
-            object.
+            according to the ``neighbor_flavor`` set on the :class:`Benchmarker` (cuML on GPU when
+            available with ``"auto"``, or ``pynndescent`` on CPU). When provided, this function takes
+            precedence over ``neighbor_flavor``. The function should accept the data and the number of
+            neighbors and return a :class:`~scib_metrics.utils.nearest_neighbors.NeighborsResults` object.
         """
         if self._use_precomputed_neighbors:
             warnings.warn(
@@ -343,9 +352,22 @@ class Benchmarker:
             if self._progress_bar:
                 progress = tqdm(progress, desc="Computing neighbors")
 
+            # Resolve which neighbor backend to use
+            use_gpu_neighbors = (
+                self._neighbor_flavor == "gpu"
+                or (self._neighbor_flavor == "auto" and cuml_available())
+            )
+            if self._neighbor_flavor == "gpu" and not cuml_available():
+                raise RuntimeError(
+                    "neighbor_flavor='gpu' requested but cuML is not available. "
+                    "Install cuml or use neighbor_flavor='auto'/'cpu'."
+                )
+
             for ad in progress:
                 if neighbor_computer is not None:
                     neigh_result = neighbor_computer(ad.X, max(self._neighbor_values))
+                elif use_gpu_neighbors:
+                    neigh_result = cuml_nndescent(ad.X, n_neighbors=max(self._neighbor_values))
                 else:
                     neigh_result = pynndescent(
                         ad.X, n_neighbors=max(self._neighbor_values), random_state=0, n_jobs=self._n_jobs
