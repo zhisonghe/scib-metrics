@@ -5,7 +5,7 @@ from scib_metrics.nearest_neighbors import NeighborsResults
 from scib_metrics.utils import compute_simpson_index
 
 
-def lisi_knn(X: NeighborsResults, labels: np.ndarray, perplexity: float = None) -> np.ndarray:
+def lisi_knn(X: NeighborsResults, labels: np.ndarray, perplexity: float = None, flavor: str = "auto") -> np.ndarray:
     """Compute the local inverse simpson index (LISI) for each cell :cite:p:`korsunsky2019harmony`.
 
     Parameters
@@ -18,6 +18,10 @@ def lisi_knn(X: NeighborsResults, labels: np.ndarray, perplexity: float = None) 
     perplexity
         Parameter controlling effective neighborhood size. If None, the
         perplexity is set to the number of neighbors // 3.
+    flavor
+        Backend for Simpson index computation. ``"auto"`` (default) uses the
+        PyTorch GPU backend when CUDA is available and falls back to JAX;
+        ``"torch"`` forces PyTorch; ``"jax"`` forces JAX.
 
     Returns
     -------
@@ -34,12 +38,20 @@ def lisi_knn(X: NeighborsResults, labels: np.ndarray, perplexity: float = None) 
     n_labels = len(np.unique(labels))
 
     simpson = compute_simpson_index(
-        knn_dists=knn_dists, knn_idx=knn_idx, row_idx=row_idx, labels=labels, n_labels=n_labels, perplexity=perplexity
+        knn_dists=knn_dists,
+        knn_idx=knn_idx,
+        row_idx=row_idx,
+        labels=labels,
+        n_labels=n_labels,
+        perplexity=perplexity,
+        flavor=flavor,
     )
     return 1 / simpson
 
 
-def ilisi_knn(X: NeighborsResults, batches: np.ndarray, perplexity: float = None, scale: bool = True) -> float:
+def ilisi_knn(
+    X: NeighborsResults, batches: np.ndarray, perplexity: float = None, scale: bool = True, flavor: str = "auto"
+) -> float:
     """Compute the integration local inverse simpson index (iLISI) for each cell :cite:p:`korsunsky2019harmony`.
 
     Returns a scaled version of the iLISI score for each cell, by default :cite:p:`luecken2022benchmarking`.
@@ -56,6 +68,10 @@ def ilisi_knn(X: NeighborsResults, batches: np.ndarray, perplexity: float = None
         perplexity is set to the number of neighbors // 3.
     scale
         Scale lisi into the range [0, 1]. If True, higher values are better.
+    flavor
+        Backend for Simpson index computation. ``"auto"`` (default) uses the
+        PyTorch GPU backend when CUDA is available and falls back to JAX;
+        ``"torch"`` forces PyTorch; ``"jax"`` forces JAX.
 
     Returns
     -------
@@ -63,7 +79,7 @@ def ilisi_knn(X: NeighborsResults, batches: np.ndarray, perplexity: float = None
         iLISI score.
     """
     batches = np.asarray(pd.Categorical(batches).codes)
-    lisi = lisi_knn(X, batches, perplexity=perplexity)
+    lisi = lisi_knn(X, batches, perplexity=perplexity, flavor=flavor)
     ilisi = np.nanmedian(lisi)
     if scale:
         nbatches = len(np.unique(batches))
@@ -71,7 +87,9 @@ def ilisi_knn(X: NeighborsResults, batches: np.ndarray, perplexity: float = None
     return ilisi
 
 
-def clisi_knn(X: NeighborsResults, labels: np.ndarray, perplexity: float = None, scale: bool = True) -> float:
+def clisi_knn(
+    X: NeighborsResults, labels: np.ndarray, perplexity: float = None, scale: bool = True, flavor: str = "auto"
+) -> float:
     """Compute the cell-type local inverse simpson index (cLISI) for each cell :cite:p:`korsunsky2019harmony`.
 
     Returns a scaled version of the cLISI score for each cell, by default :cite:p:`luecken2022benchmarking`.
@@ -88,6 +106,10 @@ def clisi_knn(X: NeighborsResults, labels: np.ndarray, perplexity: float = None,
         perplexity is set to the number of neighbors // 3.
     scale
         Scale lisi into the range [0, 1]. If True, higher values are better.
+    flavor
+        Backend for Simpson index computation. ``"auto"`` (default) uses the
+        PyTorch GPU backend when CUDA is available and falls back to JAX;
+        ``"torch"`` forces PyTorch; ``"jax"`` forces JAX.
 
     Returns
     -------
@@ -103,7 +125,7 @@ def clisi_knn(X: NeighborsResults, labels: np.ndarray, perplexity: float = None,
             UserWarning,
         )
     labels_coded = np.asarray(pd.Categorical(labels).codes)
-    lisi = lisi_knn(X, labels_coded, perplexity=perplexity)
+    lisi = lisi_knn(X, labels_coded, perplexity=perplexity, flavor=flavor)
     # Exclude NaN-labeled cells from the summary statistic
     lisi_valid = lisi[~nan_mask]
     clisi = np.nanmedian(lisi_valid)

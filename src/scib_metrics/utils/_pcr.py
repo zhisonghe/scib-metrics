@@ -1,12 +1,32 @@
 import jax.numpy as jnp
 import numpy as np
 import pandas as pd
+import warnings
 from jax import jit
 
 from scib_metrics._types import NdArray
 
-from ._pca import pca
+from ._pca import _flush_gpu_memory, _is_oom_error, pca
 from ._utils import one_hot
+
+
+def _pcr_torch(X_pca: np.ndarray, covariate: np.ndarray, var: np.ndarray) -> float:
+    """PCR via torch.linalg.lstsq (GPU-accelerated when CUDA is available)."""
+    import torch
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    X_t = torch.tensor(np.ascontiguousarray(X_pca), dtype=torch.float32, device=device)
+    cov_t = torch.tensor(np.ascontiguousarray(covariate), dtype=torch.float32, device=device)
+    var_t = torch.tensor(np.ascontiguousarray(var), dtype=torch.float32, device=device)
+
+    solution = torch.linalg.lstsq(cov_t, X_t).solution
+    predicted = cov_t @ solution
+    residual_sum = ((X_t - predicted) ** 2).sum(dim=0)
+    total_sum = ((X_t - X_t.mean(dim=0, keepdim=True)) ** 2).sum(dim=0)
+    r2 = torch.clamp(1.0 - residual_sum / total_sum.clamp(min=1e-30), min=0.0)
+
+    pcr = (r2.ravel() @ var_t) / var_t.sum().clamp(min=1e-30)
+    return float(pcr.cpu().item())
 
 
 def principal_component_regression(
@@ -14,6 +34,7 @@ def principal_component_regression(
     covariate: NdArray,
     categorical: bool = False,
     n_components: int | None = None,
+    flavor: str = "auto",
 ) -> float:
     """Principal component regression (PCR) :cite:p:`buttner2018`.
 
@@ -28,6 +49,9 @@ def principal_component_regression(
     n_components:
         Number of components to compute, passed into :func:`~scib_metrics.utils.pca`.
         If None, all components are used.
+    flavor
+        Backend to use. ``"auto"`` (default) and ``"torch"`` use PyTorch (GPU if
+        CUDA is available, otherwise CPU). ``"jax"`` uses JAX.
 
     Returns
     -------
@@ -43,9 +67,36 @@ def principal_component_regression(
     else:
         covariate = np.asarray(covariate)
 
+    use_torch = flavor in ("torch", "auto")
+
+    if use_torch:
+        try:
+            if categorical:
+                n_classes = int(covariate.max()) + 1
+                covariate_np = np.eye(n_classes, dtype=np.float32)[covariate]
+            else:
+                covariate_np = covariate.astype(np.float32).reshape((covariate.shape[0], 1))
+
+            pca_results = pca(X, n_components=n_components, flavor=flavor)
+            covariate_np = covariate_np - covariate_np.mean(axis=0)
+            return _pcr_torch(pca_results.coordinates, covariate_np, pca_results.variance)
+        except ImportError:
+            pass  # torch not installed — fall through to JAX
+        except RuntimeError as e:
+            if _is_oom_error(e):
+                _flush_gpu_memory()
+                warnings.warn(
+                    "CUDA out-of-memory during PCR. Falling back to JAX CPU backend.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+            else:
+                raise
+
+    # JAX path
     covariate = one_hot(covariate) if categorical else covariate.reshape((covariate.shape[0], 1))
 
-    pca_results = pca(X, n_components=n_components)
+    pca_results = pca(X, n_components=n_components, flavor="jax")
 
     # Center inputs for no intercept
     covariate = covariate - jnp.mean(covariate, axis=0)
