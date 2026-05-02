@@ -12,6 +12,7 @@ def silhouette_label(
     rescale: bool = True,
     chunk_size: int = 256,
     metric: Literal["euclidean", "cosine"] = "euclidean",
+    flavor: Literal["auto", "torch", "jax"] = "auto",
 ) -> float:
     """Average silhouette width (ASW) :cite:p:`luecken2022benchmarking`.
 
@@ -29,12 +30,15 @@ def silhouette_label(
         Size of chunks to process at a time for distance computation
     metric
         The distance metric to use. The distance function can be 'euclidean' (default) or 'cosine'.
+    flavor
+        Which backend to use.  ``"auto"`` (default) selects ``"torch"`` when
+        PyTorch with CUDA is available, and falls back to ``"jax"`` otherwise.
 
     Returns
     -------
     silhouette score
     """
-    asw = np.mean(silhouette_samples(X, labels, chunk_size=chunk_size, metric=metric))
+    asw = np.mean(silhouette_samples(X, labels, chunk_size=chunk_size, metric=metric, flavor=flavor))
     if rescale:
         asw = (asw + 1) / 2
     return np.mean(asw)
@@ -48,6 +52,7 @@ def silhouette_batch(
     chunk_size: int = 256,
     metric: Literal["euclidean", "cosine"] = "euclidean",
     between_cluster_distances: Literal["nearest", "mean_other", "furthest"] = "nearest",
+    flavor: Literal["auto", "torch", "jax"] = "auto",
 ) -> float:
     """Average silhouette width (ASW) with respect to batch ids within each label :cite:p:`luecken2022benchmarking`.
 
@@ -74,6 +79,9 @@ def silhouette_batch(
         - 'nearest': Standard silhouette (distance to nearest cluster)
         - 'mean_other': BRAS-specific (mean distance to all other clusters)
         - 'furthest': BRAS-specific (distance to furthest cluster)
+    flavor
+        Which backend to use.  ``"auto"`` (default) selects ``"torch"`` when
+        PyTorch with CUDA is available, and falls back to ``"jax"`` otherwise.
 
     Returns
     -------
@@ -96,6 +104,7 @@ def silhouette_batch(
             chunk_size=chunk_size,
             metric=metric,
             between_cluster_distances=between_cluster_distances,
+            flavor=flavor,
         )
 
         # take only absolute value
