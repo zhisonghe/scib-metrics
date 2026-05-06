@@ -173,7 +173,6 @@ def _compute_nmi_ari_gpu(labels_true: np.ndarray, labels_pred: np.ndarray) -> tu
     (nmi, ari) as Python floats.
     """
     import torch
-    from torchmetrics.functional.clustering import adjusted_rand_score as tm_ari
     from torchmetrics.functional.clustering import normalized_mutual_info_score as tm_nmi
 
     # Encode ground-truth labels to contiguous integers (handles string labels)
@@ -183,7 +182,10 @@ def _compute_nmi_ari_gpu(labels_true: np.ndarray, labels_pred: np.ndarray) -> tu
     t_pred = torch.tensor(np.asarray(labels_pred, dtype="int64"), dtype=torch.long, device=device)
 
     nmi = tm_nmi(t_pred, t_true, average_method="arithmetic").item()
-    ari = tm_ari(t_pred, t_true).item()
+    # torchmetrics ARI uses int64 arithmetic internally; for large datasets (≥~100k cells)
+    # products of O(n²) values overflow int64, producing values outside [-1, 1].
+    # sklearn uses float64 throughout and is correct regardless of dataset size.
+    ari = adjusted_rand_score(labels_true, np.asarray(labels_pred))
     return float(nmi), float(ari)
 
 
